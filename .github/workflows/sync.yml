@@ -1,0 +1,212 @@
+name: Sync with upstream SillyTavern
+
+on:
+  schedule:
+    - cron: '0 3 * * *'  # 每天凌晨 3:00 UTC 运行
+  workflow_dispatch:  # 允许手动触发
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout your release branch
+        uses: actions/checkout@v4
+        with:
+          ref: release
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Setup local branch
+        run: |
+          # 切换到本地 release 分支（如果已存在则直接切换，否则创建）
+          if git show-ref --verify --quiet refs/heads/release; then
+            git checkout release
+            echo "✓ 已切换到本地 release 分支"
+          else
+            git checkout -b release origin/release
+            echo "✓ 已创建并切换到本地 release 分支"
+          fi
+
+      - name: Configure Git identity
+        run: |
+          git config user.email "actions@github.com"
+          git config user.name "GitHub Actions"
+
+      - name: Add upstream remote
+        run: git remote add upstream https://github.com/SillyTavern/SillyTavern.git
+
+      # =============== 同步上游 release 分支（保留 sync.yml 和 STVersions.json） ===============
+      - name: Sync with upstream (keep custom files)
+        run: |
+          set -e
+
+          echo "::group::Step 1: 备份自定义文件"
+          mkdir -p /tmp/backup
+          # 备份 STVersions.json
+          if [ -f STVersions.json ]; then
+            echo "✓ 备份 STVersions.json"
+            cp STVersions.json /tmp/backup/
+          fi
+          # 备份 sync.yml
+          if [ -f .github/workflows/sync.yml ]; then
+            echo "✓ 备份 sync.yml"
+            mkdir -p /tmp/backup/workflows
+            cp .github/workflows/sync.yml /tmp/backup/workflows/
+          fi
+          echo "::endgroup::"
+
+          echo "::group::Step 2: 拉取上游代码"
+          git fetch upstream release
+          echo "✓ 已拉取 upstream/release"
+          echo "::endgroup::"
+
+          echo "::group::Step 3: 合并上游更改"
+          # 检查是否需要同步
+          LOCAL_HEAD=$(git rev-parse HEAD)
+          UPSTREAM_HEAD=$(git rev-parse upstream/release)
+          if [ "$LOCAL_HEAD" = "$UPSTREAM_HEAD" ]; then
+            echo "⏭️ 本地已是最新的上游版本，无需同步"
+            echo "::endgroup::"
+            exit 0
+          fi
+          echo "上游版本: $(git log -1 --format='%h %s' upstream/release)"
+          echo "本地版本: $(git log -1 --format='%h %s' HEAD)"
+
+          # 尝试合并，如果失败则强制使用上游版本
+          if ! git merge upstream/release --no-edit --strategy-option=theirs 2>/dev/null; then
+            echo "⚠️ 合并冲突，强制使用上游版本..."
+            # 重置到上游版本，丢弃所有本地更改
+            git reset --hard upstream/release
+            echo "✓ 已重置到 upstream/release"
+          fi
+          echo "✓ 已合并 upstream/release"
+          echo "::endgroup::"
+
+          echo "::group::Step 4: 恢复自定义文件并清理其他 workflows"
+          # 清理整个 workflows 目录
+          echo "清理 .github/workflows 目录"
+          rm -rf .github/workflows
+          mkdir -p .github/workflows
+
+          # 恢复 sync.yml
+          if [ -f /tmp/backup/workflows/sync.yml ]; then
+            cp /tmp/backup/workflows/sync.yml .github/workflows/sync.yml
+            echo "✓ 已恢复 sync.yml"
+          fi
+          echo "::endgroup::"
+
+          echo "::group::Step 5: 提交自定义文件"
+          # 只提交自定义文件
+          git add -A
+
+          if git diff --cached --quiet HEAD; then
+            echo "⏭️ 没有检测到新的变更，无需提交"
+          else
+            echo "检测到变更，准备提交..."
+            git commit -m "chore: preserve custom files (sync.yml)"
+          fi
+          echo "::endgroup::"
+
+          echo "::group::Step 6: 推送到远程"
+          # 使用强制推送，因为我们使用了 reset --hard
+          git push --force origin release
+          echo "✅ 同步完成并推送到 origin/release"
+          echo "::endgroup::"
+
+          echo "::group::Step 7: 清理"
+          rm -rf /tmp/backup
+          echo "✓ 清理完成"
+          echo "::endgroup::"
+
+      # =============== 生成 STVersions.json（仅 ≥1.12.0 的语义化版本） ===============
+      - name: Generate STVersions.json from upstream tags (≥1.12.0)
+        run: |
+          set -e
+          upstream_repo="https://github.com/SillyTavern/SillyTavern.git"
+
+          # 获取上游 release 分支的 commit SHA（用于记录真实版本）
+          # 这样启动器可以切换到这个 commit，获取纯净的上游代码
+          UPSTREAM_COMMIT=$(git rev-parse upstream/release)
+          echo "上游版本 commit: $UPSTREAM_COMMIT"
+
+          # --- 初始化 ---
+          rm -f /tmp/versions.txt /tmp/sorted.txt
+          touch /tmp/versions.txt
+
+          # --- 获取并筛选标签 ---
+          echo "Fetching tags from $upstream_repo..."
+          git ls-remote --tags --refs "$upstream_repo" | while IFS=$'\t' read -r sha ref; do
+            tag="${ref#refs/tags/}"
+            if [[ "$tag" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              ver=$(echo "$tag" | sed 's/^v//')
+              if [[ "$(printf '%s\n1.12.0' "$ver" | sort -V | head -n1)" == "1.12.0" ]]; then
+                date=$(git show -s --format=%cI "$sha")
+                echo "$ver|$sha|$date" >> /tmp/versions.txt
+              fi
+            fi
+          done
+
+          # --- 构建 STVersions.json ---
+          if [ -s /tmp/versions.txt ]; then
+            echo "Processing versions..."
+            sort -Vr /tmp/versions.txt > /tmp/sorted.txt
+            latest=$(head -n1 /tmp/sorted.txt | cut -d'|' -f1)
+
+            # 获取上游 commit 对应的版本标签
+            # 如果上游 commit 有对应的标签版本，使用对应的版本号
+            # 否则使用最新的上游版本号
+            current_version=""
+
+            while IFS='|' read -r ver sha date; do
+              if [ "$sha" = "$UPSTREAM_COMMIT" ]; then
+                current_version="$ver"
+                break
+              fi
+            done < /tmp/sorted.txt
+
+            # 如果上游 commit 没有对应的标签，使用最新的上游标签
+            if [ -z "$current_version" ]; then
+              current_version="$latest"
+            fi
+
+            echo "当前上游版本: $current_version"
+            echo "Latest version: $latest"
+
+            # 初始化 JSON 结构，使用上游 commit 作为 current_commit
+            jq -n \
+              --arg l "$latest" \
+              --arg v "$current_version" \
+              --arg c "$UPSTREAM_COMMIT" \
+              '{latest: $l, current_version: $v, current_commit: $c, versions: {}}' \
+              > STVersions.json
+
+            # 遍历版本列表，构建 versions 映射
+            while IFS='|' read -r ver sha date; do
+              jq --arg v "$ver" --arg s "$sha" --arg d "$date" \
+                '.versions[$v] = {commit: $s, date: $d}' \
+                STVersions.json > tmp.$$.json && mv tmp.$$.json STVersions.json
+            done < /tmp/sorted.txt
+
+            echo "✓ STVersions.json updated"
+          else
+            echo "No tags >= 1.12.0 found."
+          fi
+
+          # --- 提交和推送 ---
+          git add STVersions.json
+          if ! git diff --cached --quiet -- STVersions.json; then
+            git commit -m "chore: update STVersions.json"
+            git push origin release
+            echo "✓ Pushed STVersions.json"
+          else
+            echo "⏭️ No changes to STVersions.json"
+            git reset HEAD STVersions.json > /dev/null 2>&1 || true
+          fi
+
+          rm -f /tmp/versions.txt /tmp/sorted.txt tmp.$$.json
